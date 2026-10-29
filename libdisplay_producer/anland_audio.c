@@ -42,6 +42,8 @@ struct anland_audio {
     struct spa_hook        capture_listener;
     struct pw_stream      *source;    /* virtual Audio/Source <- socket (capture) */
     struct spa_hook        source_listener;
+    bool                   capture_requested; /* PipeWire source STREAMING */
+    uint64_t               capture_sent_ms;   /* successful lease renewal */
 
     /* Negotiated formats (the consumer owns the hardware and dictates these via
      * AUDIO_MSG_FORMAT). Defaults stand until the consumer's formats arrive. */
@@ -69,6 +71,29 @@ static int connect_stream(struct pw_stream *stream, enum spa_direction direction
 static const struct spa_pod *build_format(struct spa_pod_builder *bld,
                                           uint32_t rate, uint32_t channels);
 static void set_latency(struct pw_stream *stream, uint32_t quantum, uint32_t rate);
+
+/* Runs under the PipeWire loop lock. STOP is best-effort; Android also expires
+ * the lease if the datagram is dropped or the producer disappears. */
+static void send_capture_request(struct anland_audio *a, bool active, bool force)
+{
+    if (a->audio_fd < 0)
+        return;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t now = (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+    if (!force && now - a->capture_sent_ms < AUDIO_CAPTURE_REFRESH_MS)
+        return;
+    struct {
+        struct audio_msg header;
+        uint32_t active;
+    } packet = {
+        .header = { .type = AUDIO_MSG_CAPTURE_ACTIVE, .size = sizeof(uint32_t) },
+        .active = active && a->pw_connected,
+    };
+    if (send(a->audio_fd, &packet, sizeof(packet), MSG_DONTWAIT | MSG_NOSIGNAL)
+            == (ssize_t)sizeof(packet))
+        a->capture_sent_ms = now;
+}
 
 /* ---- mic ring buffer (single-threaded: loop thread only) ---- */
 
@@ -115,6 +140,8 @@ static size_t ring_read(struct anland_audio *a, uint8_t *p, size_t n)
 static void detach_audio_fd_locked(struct anland_audio *a)
 {
     struct spa_source *io = a->io;
+    send_capture_request(a, false, true);
+    a->capture_sent_ms = 0;
     a->io = NULL;
     a->audio_fd = -1;
     ring_reset(a);
@@ -153,6 +180,8 @@ static void on_capture_process(void *data)
 static void on_source_process(void *data)
 {
     struct anland_audio *a = data;
+    if (a->capture_requested)
+        send_capture_request(a, true, false); /* renew only while frames are requested */
     struct pw_buffer *b = pw_stream_dequeue_buffer(a->source);
     if (!b)
         return;
@@ -179,8 +208,23 @@ static const struct pw_stream_events capture_events = {
     .process = on_capture_process,
 };
 
+static void on_source_state_changed(void *data, enum pw_stream_state old,
+                                    enum pw_stream_state state, const char *error)
+{
+    struct anland_audio *a = data;
+    (void)old;
+    (void)error;
+    a->capture_requested = state == PW_STREAM_STATE_STREAMING;
+    if (!a->capture_requested) {
+        ring_reset(a);
+        memset(a->ring, 0, a->ring_size);
+    }
+    send_capture_request(a, a->capture_requested, true);
+}
+
 static const struct pw_stream_events source_events = {
     PW_VERSION_STREAM_EVENTS,
+    .state_changed = on_source_state_changed,
     .process = on_source_process,
 };
 
@@ -289,7 +333,8 @@ static void on_audio_readable(void *data, int fd, uint32_t mask)
         if (h.type != AUDIO_MSG_PCM)
             continue;
         size_t size = h.size < avail ? h.size : avail;
-        ring_write(a, a->rx + sizeof(struct audio_msg), size);
+        if (a->capture_requested && a->pw_connected)
+            ring_write(a, a->rx + sizeof(struct audio_msg), size);
     }
 }
 
@@ -304,8 +349,8 @@ static void arm_reconnect(struct anland_audio *a)
 
 /* Fatal, non-recoverable error on the core proxy means the sound service connection
  * was lost (e.g. pipewire/wireplumber restarted). Drop the dead core+streams and
- * schedule a rebuild; the audio socket / mic ring are untouched so the consumer side
- * keeps working and resumes the moment PipeWire is back. */
+ * schedule a rebuild; the audio socket remains attached for playback, but capture
+ * demand is revoked and its ring reset until a new source graph starts streaming. */
 static void on_core_error(void *data, uint32_t id, int seq, int res, const char *message)
 {
     struct anland_audio *a = data;
@@ -313,6 +358,9 @@ static void on_core_error(void *data, uint32_t id, int seq, int res, const char 
     (void)message;
     if (id == PW_ID_CORE && res == -EPIPE) {
         a->pw_connected = false;
+        a->capture_requested = false;
+        ring_reset(a);
+        send_capture_request(a, false, true);
         arm_reconnect(a);   /* teardown + rebuild happens in the timer, not here */
     }
 }
@@ -374,6 +422,9 @@ static int connect_stream(struct pw_stream *stream, enum spa_direction direction
  * ring and audio-socket io source intact. Idempotent. */
 static void teardown_pw(struct anland_audio *a)
 {
+    a->capture_requested = false;
+    ring_reset(a);
+    send_capture_request(a, false, true);
     if (a->capture) {
         spa_hook_remove(&a->capture_listener);
         pw_stream_destroy(a->capture);
@@ -480,6 +531,8 @@ void anland_audio_set_fd(int audio_fd)
                                    SPA_IO_IN, true, on_audio_readable, a);
             if (a->io) {
                 a->audio_fd = owned_fd;
+                a->capture_sent_ms = 0;
+                send_capture_request(a, a->capture_requested, true);
             } else {
                 close(owned_fd);
             }

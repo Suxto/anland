@@ -186,7 +186,9 @@ struct OutputEvent{
  * blocks input/clipboard. The socket is full duplex: the producer writes desktop
  * playback PCM that the consumer reads, and the consumer writes microphone PCM
  * that the producer reads -- each side only ever reads what the other wrote.
- * Every direction sends one AUDIO_MSG_FORMAT, then a stream of AUDIO_MSG_PCM.
+ * Playback starts with AUDIO_MSG_FORMAT then AUDIO_MSG_PCM. Microphone capture
+ * additionally requires a renewable AUDIO_MSG_CAPTURE_ACTIVE lease; merely
+ * connecting or exposing the virtual source never opens the Android input.
  *
  * PCM is interleaved per frame. For stereo (channels == 2) the sample order
  * within each frame is LEFT then RIGHT, i.e. channel positions FL, FR -- the
@@ -194,15 +196,23 @@ struct OutputEvent{
  * honour this order so the left/right channels are never swapped.
  *
  * Audio quality is negotiated, not pinned: the consumer owns the real hardware,
- * so on connect it opens its AAudio streams, reads back the rate/channels the
- * device actually chose, and sends one AUDIO_MSG_FORMAT per direction (tagged with
- * role) to the producer. The producer builds its PipeWire sink/source to match,
+ * so on connect it announces playback and default capture formats. Only on a
+ * capture request does it open the input and announce its device-chosen format.
+ * Format announcements carry a direction role. The producer builds its PipeWire sink/source to match,
  * so neither side resamples blindly and the PCM byte math lines up on both ends.
  */
 #define AUDIO_MSG_FORMAT 1
 #define AUDIO_MSG_PCM    2
 #define AUDIO_MSG_SHM 3 // request shared-memory ring-buffer audio transport instead of socket sends (fewer copies, lower latency)
 #define AUDIO_MSG_SHM_FD 4 // producer -> consumer: shared-memory fd, consumer mmaps it and reads audio data directly
+/* Producer -> consumer, exact uint32_t payload: 0 releases, 1 renews demand.
+ * Lease expiry is fail-closed if STOP is dropped or the producer crashes while
+ * another owner still holds the audio socket. This does not grant mic permission.
+ * New consumer + old producer: mic stays off (speaker PCM remains compatible).
+ */
+#define AUDIO_MSG_CAPTURE_ACTIVE 5
+#define AUDIO_CAPTURE_LEASE_MS 1000
+#define AUDIO_CAPTURE_REFRESH_MS 250
 
 /* PCM sample format codes for struct audio_format.format. */
 #define AUDIO_FORMAT_S16LE 0
@@ -220,7 +230,7 @@ struct audio_format {
 } __attribute__((packed));
 
 struct audio_msg {
-    uint32_t type;       /* AUDIO_MSG_FORMAT | AUDIO_MSG_PCM */
+    uint32_t type;       /* AUDIO_MSG_* */
     uint32_t size;       /* payload bytes that follow this header */
 } __attribute__((packed));
 

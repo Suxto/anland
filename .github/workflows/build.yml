@@ -6,8 +6,40 @@ on:
   workflow_dispatch:
   workflow_call:
 
+permissions:
+  contents: read
+
 jobs:
+  build-audio:
+    name: Microphone lifecycle tests and ARM64 producer candidate
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build pkg-config libpipewire-0.3-dev
+      - name: Run native tests (fake AAudio, private sockets only)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests/audio -v
+      - name: Build the real ARM64 producer library
+        run: |
+          cmake -S . -B build_audio -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib
+          cmake --build build_audio --target display_producer --parallel 2
+          DESTDIR="$PWD/audio-stage" cmake --install build_audio
+          cp doc/microphone-ondemand.md audio-stage/README-microphone-ondemand.md
+          find audio-stage -type f -print0 | sort -z | xargs -0 sha256sum > audio-stage-SHA256SUMS
+      - name: Upload producer candidate (not a drop-in KWin package)
+        uses: actions/upload-artifact@v7
+        with:
+          name: anland-mic-producer-arm64-candidate
+          path: |
+            audio-stage/
+            audio-stage-SHA256SUMS
+
   build-apk:
+    needs: build-audio
     runs-on: ubuntu-latest
     strategy:
       # One plain APK and one with the Tracy client enabled for profiling
@@ -82,6 +114,7 @@ jobs:
           path: consumers/anland_v5/android_consumer/app/build/outputs/apk/${{ matrix.name }}.apk
 
   build-daemon:
+    needs: build-audio
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

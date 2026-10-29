@@ -12,6 +12,12 @@
  *   - a virtual Audio/Source stream  <- microphone PCM read from the audio socket
  *                                        (so Linux apps can record the Android mic).
  *
+ * Microphone hardware is requested only while the virtual source is STREAMING.
+ * Active process callbacks renew a one-second capture lease; STOP, disconnect or
+ * loss of renewals releases Android input without removing the virtual node.
+ * Recording applications share this node's graph lifecycle; one app ending its
+ * stream does not stop another app still consuming it.
+ *
  * The streams are NEVER torn down on consumer disconnect: while detached the capture
  * stream simply drops its PCM and the source feeds silence, so PipeWire (and every
  * recording app) never sees the device disappear. Only the socket fd is hot-swapped:
