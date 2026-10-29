@@ -13,6 +13,9 @@ int get_audio_fd(display_ctx *ctx) { return ctx->audio_fd; }
 
 static void wait_active(int expected, int milliseconds)
 {
+    static int stage;
+    fprintf(stderr, "capture test stage %d: want=%d active=%d opens=%d closes=%d\n",
+            ++stage, expected, atomic_load(&fake_active), atomic_load(&fake_opens), atomic_load(&fake_closes));
     uint64_t until = now_ms() + milliseconds;
     while (atomic_load(&fake_active) != expected && now_ms() < until)
         usleep(5000);
@@ -99,9 +102,18 @@ int main(void)
     audio_set_ctx(second, &other_ctx);
     audio_set_mic_enabled(second, true);
     audio_start(second);
-    request(pair[1], 1);
-    request(other[1], 1);
-    wait_active(2, 800);
+    uint64_t multi_until = now_ms() + 800, last_renewal = 0;
+    while (fake_active != 2 && now_ms() < multi_until) {
+        /* A reconnect can invalidate a packet already in an old poll snapshot;
+         * real producers renew every 250ms, rather than asserting demand once. */
+        if (now_ms() - last_renewal >= AUDIO_CAPTURE_REFRESH_MS) {
+            request(pair[1], 1);
+            request(other[1], 1);
+            last_renewal = now_ms();
+        }
+        usleep(5000);
+    }
+    assert(fake_active == 2);
     request(pair[1], 0);
     wait_active(1, 800);
     audio_destroy(second);
