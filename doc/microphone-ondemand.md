@@ -36,6 +36,19 @@ if one application ends recording while another still consumes the node, capture
 continues. Separate Anland windows retain independent audio bridges; stopping
 one closes only its own shared AAudio input, not another window/app's input.
 
+## Parallel APK identity
+
+This branch builds `com.anland.consumer.micondemand`, labelled **Anland Mic Test**.
+Java/JNI namespaces remain `com.anland.consumer`; the launcher shortcut and
+accessibility component use the new application identity instead of targeting
+original-app settings. Installation does not replace `com.anland.consumer`.
+
+The test app starts with its own preferences/permissions. Do not copy the original
+app's microphone/camera/accessibility settings or grant permissions implicitly.
+Droidspaces' existing launcher still targets the original app until separately
+configured for a matched desktop backend. Installing the parallel APK alone does
+not enable microphone on demand for an old producer.
+
 ## Paired-version requirement
 
 - **New APK + new producer:** microphone on demand.

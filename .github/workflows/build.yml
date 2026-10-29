@@ -107,6 +107,14 @@ jobs:
           cp app/build/outputs/apk/${{ matrix.apk }} \
              app/build/outputs/apk/${{ matrix.name }}.apk
 
+      - name: Verify parallel APK identity
+        working-directory: consumers/anland_v5/android_consumer
+        run: |
+          "$ANDROID_HOME/build-tools/34.0.0/aapt2" dump badging \
+            app/build/outputs/apk/${{ matrix.name }}.apk > apk-identity.txt
+          grep -F "package: name='com.anland.consumer.micondemand' " apk-identity.txt
+          grep -F "application-label:'Anland Mic Test'" apk-identity.txt
+
       - name: Upload APK
         uses: actions/upload-artifact@v7
         with:

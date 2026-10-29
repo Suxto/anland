@@ -2,6 +2,7 @@ package com.anland.consumer;
 
 import android.accessibilityservice.AccessibilityService;
 import android.accessibilityservice.AccessibilityServiceInfo;
+import android.content.ComponentName;
 import android.content.Context;
 import android.content.SharedPreferences;
 import android.os.Handler;
@@ -57,7 +58,7 @@ public class KeyInterceptor extends AccessibilityService {
 
     public static void launch(Context ctx) {
         try {
-            String service = "com.anland.consumer/.KeyInterceptor";
+            String service = new ComponentName(ctx, KeyInterceptor.class).flattenToShortString();
             String enabled = Settings.Secure.getString(ctx.getContentResolver(),
                     Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
 
