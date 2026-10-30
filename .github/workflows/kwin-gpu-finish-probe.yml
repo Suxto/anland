@@ -1,0 +1,67 @@
+name: KWin GPU finish probe
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [display-gpu-finish-probe]
+    paths: [.github/workflows/kwin-gpu-finish-probe.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  kwin:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Build native Arch GPU synchronization probe
+        env:
+          IMAGE: ogarcia/archlinux@sha256:26d1016f2c1ce083917cbc42608127747b0c2d81bc24807e681beb64c61b542c
+        run: |
+          set -euo pipefail
+          mkdir -p kwin-output
+          docker run --rm -i --platform linux/arm64 \
+            -e SOURCE_COMMIT="$GITHUB_SHA" \
+            -v "$PWD:/source:ro" -v "$PWD/kwin-output:/out" "$IMAGE" bash -s <<'BUILD'
+          set -euo pipefail
+          pacman -Syu --noconfirm
+          pacman -S --noconfirm --needed base-devel git ca-certificates sudo python
+          useradd -m -s /bin/bash anland
+          printf 'anland ALL=(root) NOPASSWD: /usr/bin/pacman\n' > /etc/sudoers.d/anland-pacman
+          chmod 0440 /etc/sudoers.d/anland-pacman
+          printf "PKGEXT='.pkg.tar.zst'\nPACMAN_AUTH=(sudo)\n" > /home/anland/.makepkg.conf
+          cp -a /source /tmp/anland
+          backend=/tmp/anland/producers/kde/Arch_v5/kwin/src/backends/anland
+          # Same public-header correction as the original package CI.
+          find "$backend" -maxdepth 1 -type f -name '*.h' -exec sed -i \
+            -e 's@#include "display_producer.h"@#include "libdisplay_producer/display_producer.h"@' \
+            -e 's@#include "protocol.h"@#include "libdisplay_producer/protocol.h"@' {} +
+          PYTHONDONTWRITEBYTECODE=1 python3 /tmp/anland/tests/test_gpu_finish_probe.py -v
+          recipe=/tmp/anland/producers/kde/Arch_v5/PKGBUILD
+          grep -Fx 'pkgver=6.8.0' "$recipe"
+          grep -Fx 'pkgrel=1.1' "$recipe"
+          sed -i 's/^pkgrel=1.1$/pkgrel=1.4/' "$recipe"
+          chown -R anland:anland /tmp/anland /out /home/anland/.makepkg.conf
+          cd /tmp/anland/producers/kde/Arch_v5
+          sudo -u anland env HOME=/home/anland JOBS=4 BUILD_XWAYLAND=0 \
+            ANLAND_INSTALL=0 WORKDIR=/out/work ./build.sh --noconfirm
+          pkg=/out/work/packages/kwin-6.8.0-1.4-aarch64.pkg.tar.zst
+          test -s "$pkg"
+          test "$(pacman -Qp "$pkg")" = 'kwin 6.8.0-1.4'
+          cp "$pkg" /out/gpu-finish.pkg.tar.zst
+          printf 'source_commit=%s\nbase_commit=a9c8325c190ec4ea6cb60f16495ff3687be89ff6\nkwin=6.8.0-1.4\narch=aarch64\nprobe=glFinish-before-handoff\nmic_patch=absent\nselinux=unchanged\nxwayland=reused\ndevice_validation=not-tested\n' \
+            "$SOURCE_COMMIT" > /out/source-manifest.txt
+          cd /out
+          sha256sum gpu-finish.pkg.tar.zst > SHA256SUMS
+          BUILD
+      - uses: actions/upload-artifact@v7
+        with:
+          name: kwin-gpu-finish-arm64-probe
+          path: |
+            kwin-output/gpu-finish.pkg.tar.zst
+            kwin-output/SHA256SUMS
+            kwin-output/source-manifest.txt
+          if-no-files-found: error

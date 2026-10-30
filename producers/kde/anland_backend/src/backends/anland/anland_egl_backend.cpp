@@ -307,7 +307,15 @@ bool AnlandEglLayer::doEndFrame(const Region &renderedDeviceRegion, const Region
 bool AnlandEglLayer::doEndFrame(const QRegion &renderedDeviceRegion, const QRegion &damagedDeviceRegion, OutputFrame *frame)
 #endif
 {
-    glFlush(); // flush pending rendering commands into the dmabuf.
+    // GPU-finish probe: complete this context's drawing before handing off any
+    // buffer. This deliberately trades throughput for a synchronization test.
+    glFinish();
+    // endFrame is owned by the compositor thread; log once, after the wait returns.
+    static bool probeReported = false;
+    if (!probeReported) {
+        probeReported = true;
+        qCWarning(KWIN_ANLAND) << "ANLAND_GPU_FINISH_PROBE active: glFinish returned before frame handoff";
+    }
     // Every buffer owes this frame's damage; the buffer we just painted is now
     // fully up to date, so clear its debt.
     for (int i = 0; i < m_bufCount; i++) {
@@ -326,10 +334,9 @@ bool AnlandEglLayer::doEndFrame(const QRegion &renderedDeviceRegion, const QRegi
     // here could repaint it forever while a different slot still owes damage.
     // A target change is handled in dispatchSceneEvents().
 
-    // Instead of CPU-blocking on glFinish, create a fence for the just-submitted
-    // GPU work and hand it to the consumer. The consumer passes it to
-    // ANativeWindow_queueBuffer, so SurfaceFlinger waits on it GPU-side before
-    // scanout.
+    // Keep the original native-fence handoff unchanged. In this probe the GPU
+    // work has already been completed by glFinish above; fence delivery therefore
+    // is no longer the only barrier before Android displays a rendered buffer.
     //
     // The fence is stashed on the layer rather than pushed to the device: it now
     // travels as the frame's commit acquire fence, which the backend submits when
