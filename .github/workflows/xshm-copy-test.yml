@@ -1,0 +1,28 @@
+name: XSHM copy probe tests
+on:
+  push:
+    branches: [ds3-xshm-copy-probe]
+    paths: [tools/xshm-copy/**, .github/workflows/xshm-copy-test.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - run: sudo apt-get update && sudo apt-get install -y gcc libxcb1-dev libxcb-shm0-dev xvfb xauth
+      - name: Pixel equality and sanitizer checks
+        run: |
+          set -euo pipefail
+          cd tools/xshm-copy
+          cc -std=gnu11 -Wall -Wextra -Werror -O2 -fPIC -shared xshm-copy.c -o libxshm.so -lxcb -lxcb-shm -ldl -pthread
+          cc -std=gnu11 -Wall -Wextra -Werror -O2 pixel-test.c -o pixel-test -lxcb -pthread
+          xvfb-run -a ./pixel-test
+          xvfb-run -a env LD_PRELOAD="$PWD/libxshm.so" ./pixel-test
+          xvfb-run -a env ANLAND_XSHM_DISABLE=1 LD_PRELOAD="$PWD/libxshm.so" ./pixel-test
+          cc -std=gnu11 -Wall -Wextra -Werror -O1 -g -fPIC -shared -fsanitize=address,undefined xshm-copy.c -o libxshm-asan.so -lxcb -lxcb-shm -ldl -pthread
+          cc -std=gnu11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined pixel-test.c -o pixel-test-asan -lxcb -pthread
+          xvfb-run -a env LD_PRELOAD="$(cc -print-file-name=libasan.so):$PWD/libxshm-asan.so" ./pixel-test-asan
