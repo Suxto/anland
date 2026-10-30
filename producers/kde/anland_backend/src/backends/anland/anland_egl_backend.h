@@ -15,6 +15,8 @@
 #pragma once
 
 #include "core/outputlayer.h"
+#include "anland_frame_diagnostic.h"
+#include <chrono>
 #ifdef ANLAND_KWIN_66
 #include "opengl/eglbackend.h"
 #else
@@ -126,7 +128,14 @@ public:
     /** Wake the compositor only when the newly selected buffer owes a repaint. */
     void scheduleBufferCatchUp(int index);
 
+    // Bounded diagnostic logging only; never changes what is rendered/submitted.
+    void diagnosePresent(int target, bool layerUpdated, bool hasFence, bool handedOff);
+
 private:
+    AnlandFrameCounters m_frameCounters;
+    std::chrono::steady_clock::time_point m_diagStart{}, m_diagLastLog{};
+    unsigned m_diagExamples = 0;
+    bool m_diagFinished = false;
     void onOutputTransformChanged();
 
     AnlandEglBackend *const m_backend;

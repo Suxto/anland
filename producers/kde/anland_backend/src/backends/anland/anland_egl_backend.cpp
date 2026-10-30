@@ -106,6 +106,7 @@ void AnlandEglLayer::releaseBuffers()
 #endif
     }
     m_bufCount = 0;
+    m_frameCounters.resetSession();
 }
 
 bool AnlandEglLayer::importBuffers(int count)
@@ -342,7 +343,51 @@ bool AnlandEglLayer::doEndFrame(const QRegion &renderedDeviceRegion, const QRegi
         glFinish();
     }
     setPendingFence(fence.takeFileDescriptor().take());
+    if (!m_diagFinished) {
+        m_frameCounters.render(m_currentIndex, !renderedDeviceRegion.isEmpty(),
+                               !damagedDeviceRegion.isEmpty());
+    }
     return true;
+}
+
+void AnlandEglLayer::diagnosePresent(int slot, bool layerUpdated, bool hasFence, bool handedOff)
+{
+    if (m_diagFinished) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (m_diagStart == std::chrono::steady_clock::time_point{}) {
+        m_diagStart = now;
+    }
+    const bool debt = slot >= 0 && slot < m_bufCount && !m_accumDamage[slot].isEmpty();
+    const auto sample = m_frameCounters.present(slot, debt, hasFence, handedOff);
+    const bool unusual = !sample.painted || sample.mismatch || sample.regression;
+    // At most sixteen event examples and one summary per second for five minutes.
+    // No frame pixels, input events, addresses, or app/window names are recorded.
+    if ((unusual && m_diagExamples < 16) ||
+        now - m_diagLastLog >= std::chrono::seconds(1)) {
+        if (unusual) {
+            ++m_diagExamples;
+        }
+        m_diagLastLog = now;
+        qCWarning(KWIN_ANLAND).nospace()
+            << "ANLAND_FRAME_DIAG t_ms="
+            << std::chrono::duration_cast<std::chrono::milliseconds>(now - m_diagStart).count()
+            << " generation=" << m_backend->backend()->sessionGeneration()
+            << " target=" << slot << " rendered_slot=" << m_frameCounters.renderedSlot
+            << " updated=" << layerUpdated << " painted=" << sample.painted
+            << " debt=" << debt << " fence=" << hasFence << " handed=" << handedOff
+            << " revision=" << sample.revision << " previous=" << sample.previousRevision
+            << " renders=" << m_frameCounters.renders << " presents=" << m_frameCounters.presents
+            << " accepted=" << m_frameCounters.accepted << " unpainted=" << m_frameCounters.unpainted
+            << " unpainted_debt=" << m_frameCounters.unpaintedWithDebt
+            << " mismatches=" << m_frameCounters.mismatches
+            << " regressions=" << m_frameCounters.regressions << " unfenced=" << m_frameCounters.unfenced;
+    }
+    if (now - m_diagStart >= std::chrono::seconds(300)) {
+        m_diagFinished = true;
+        qCWarning(KWIN_ANLAND) << "ANLAND_FRAME_DIAG stopped after 300 seconds";
+    }
 }
 
 void AnlandEglLayer::setPendingFence(int fd)

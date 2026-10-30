@@ -88,7 +88,17 @@ void AnlandOutput::present(const std::shared_ptr<OutputFrame> &frame)
         fence = m_eglLayer->takePendingFence();
     }
 
+#ifdef ANLAND_KWIN_66
+    // Snapshot before presentFrame(): handing off makes the target unavailable.
+    const int diagnosticTarget = m_eglLayer ? m_eglLayer->targetBufferIndex() : -1;
+#endif
     const bool handedToConsumer = m_backend->presentFrame(fence);
+#ifdef ANLAND_KWIN_66
+    if (m_eglLayer) {
+        m_eglLayer->diagnosePresent(diagnosticTarget, layersToUpdate.contains(m_eglLayer.get()),
+                                   fence >= 0, handedToConsumer);
+    }
+#endif
     if (handedToConsumer) {
         // The frame is now SUBMITTED, not presented. It completes when the scene
         // reports PRESENTED (see onFramePresented()).
