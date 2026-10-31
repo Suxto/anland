@@ -1,0 +1,237 @@
+--- a/src/freedreno/drm/kgsl/kgsl_priv.h
++++ b/src/freedreno/drm/kgsl/kgsl_priv.h
+@@ -6,6 +6,8 @@
+ #endif
+ 
+ #include "freedreno_priv.h"
++#include "util/libsync.h"
++#include <linux/dma-buf.h>
+ 
+ /* TODO the KGSL kernel interface should probably be moved */
+ /* into someplace common that both turnip and freedreno can use */
+@@ -15,6 +17,8 @@
+ 
+ struct kgsl_device {
+     struct fd_device base;
++    bool implicit_sync;
++    unsigned sync_logs; /* Serialized by the device submit lock. */
+ };
+ FD_DEFINE_CAST(fd_device, kgsl_device);
+ 
+--- a/src/freedreno/drm/kgsl/kgsl_device.c
++++ b/src/freedreno/drm/kgsl/kgsl_device.c
+@@ -30,8 +30,17 @@
+     dev->version = FD_VERSION_ROBUSTNESS;
+     dev->features = FD_FEATURE_DIRECT_RESET | FD_FEATURE_IMPORT_DMABUF | FD_FEATURE_KGSL;
+ 
+-    /* async submit_queue used for softpin deffered submits */
+-    util_queue_init(&dev->submit_queue, "sq", 8, 1, 0, NULL);
++    kgsl_dev->implicit_sync = debug_get_bool_option("ANLAND_KGSL_IMPLICIT_SYNC", false);
++    if (kgsl_dev->implicit_sync) {
++        /* Publish shared-buffer fences before flush returns / ownership leaves
++         * this process. An explicit output fence does not mean all imported
++         * images have explicit input fences. Keep shared submits non-deferred.
++         */
++        dev->disable_explicit_sync_heuristic = true;
++    } else {
++        /* async submit_queue used for softpin deferred submits */
++        util_queue_init(&dev->submit_queue, "sq", 8, 1, 0, NULL);
++    }
+ 
+     dev->bo_size = sizeof(struct kgsl_bo);
+ 
+--- a/src/freedreno/drm/kgsl/kgsl_bo.c
++++ b/src/freedreno/drm/kgsl/kgsl_bo.c
+@@ -37,8 +37,22 @@
+ static int
+ kgsl_bo_cpu_prep(struct fd_bo *bo, struct fd_pipe *pipe, uint32_t op)
+ {
+-    /* only need to handle implicit sync here which is a NOP for KGSL */
+-    return 0;
++    struct kgsl_bo *kgsl_bo = to_kgsl_bo(bo);
++    if (!to_kgsl_device(bo->dev)->implicit_sync ||
++        kgsl_bo->bo_type != KGSL_BO_IMPORT)
++        return 0;
++
++    struct dma_buf_export_sync_file dep = {
++        .flags = (op & FD_BO_PREP_WRITE) ? DMA_BUF_SYNC_RW : DMA_BUF_SYNC_READ,
++        .fd = -1,
++    };
++    if (kgsl_pipe_safe_ioctl(kgsl_bo->import_fd,
++                            DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &dep))
++        return -errno;
++    int ret = sync_wait(dep.fd, (op & FD_BO_PREP_NOSYNC) ? 0 : 1000);
++    int error = errno;
++    close(dep.fd);
++    return ret ? -error : 0;
+ }
+ 
+ void
+--- a/src/freedreno/drm/kgsl/kgsl_ringbuffer_sp.c
++++ b/src/freedreno/drm/kgsl/kgsl_ringbuffer_sp.c
+@@ -21,14 +21,92 @@
+     return fd;
+ }
+ 
++/* Diagnostic-only, opt-in private driver: the common submit worker discards
++ * error returns, so never continue rendering after an incomplete fence handoff.
++ * The session runner must restore stock libraries after this process exits.
++ */
++static void
++sync_fatal(const char *stage)
++{
++    fprintf(stderr, "ANLAND_KGSL_SYNC fatal=%s errno=%d\n", stage, errno);
++    abort();
++}
++
++static int
++shared_dmabuf(struct fd_bo *bo)
++{
++    struct kgsl_bo *kgsl_bo = to_kgsl_bo(bo);
++    if ((bo->alloc_flags & FD_BO_SHARED) && kgsl_bo->bo_type == KGSL_BO_IMPORT) {
++        if (kgsl_bo->import_fd < 0) {
++            errno = EBADF;
++            sync_fatal("shared-fd");
++        }
++        return kgsl_bo->import_fd;
++    }
++    return -1;
++}
++
++/* Ownership (DRI3/Wayland) must exclude conflicting use across this handoff.
++ * Export is a snapshot, not an inter-process reservation. Keep every submit's
++ * BO references alive through publication, including merged earlier submits.
++ * ponytail: conservatively serialize shared readers as RW; per-use masks can
++ * recover read parallelism only after correctness has been established.
++ */
++static unsigned
++import_dependencies(struct list_head *submits, int *in_fence)
++{
++    unsigned count = 0;
++    foreach_submit (submit, submits) {
++        struct fd_submit_sp *sp = to_fd_submit_sp(submit);
++        for (unsigned i = 0; i < sp->nr_bos; i++) {
++            int fd = shared_dmabuf(sp->bos[i]);
++            if (fd < 0)
++                continue;
++            struct dma_buf_export_sync_file dep = { .flags = DMA_BUF_SYNC_RW, .fd = -1 };
++            if (kgsl_pipe_safe_ioctl(fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &dep))
++                sync_fatal("export");
++            if (*in_fence < 0) {
++                *in_fence = dep.fd;
++            } else {
++                int merged = sync_merge("anland-kgsl", *in_fence, dep.fd);
++                if (merged < 0)
++                    sync_fatal("merge");
++                close(*in_fence);
++                close(dep.fd);
++                *in_fence = merged;
++            }
++            count++;
++        }
++    }
++    return count;
++}
++
++static void
++publish_completion(struct list_head *submits, int fence)
++{
++    foreach_submit (submit, submits) {
++        struct fd_submit_sp *sp = to_fd_submit_sp(submit);
++        for (unsigned i = 0; i < sp->nr_bos; i++) {
++            int fd = shared_dmabuf(sp->bos[i]);
++            if (fd < 0)
++                continue;
++            struct dma_buf_import_sync_file done = { .flags = DMA_BUF_SYNC_RW, .fd = fence };
++            if (kgsl_pipe_safe_ioctl(fd, DMA_BUF_IOCTL_IMPORT_SYNC_FILE, &done))
++                sync_fatal("publish");
++        }
++    }
++}
++
+ static int
+ flush_submit_list(struct list_head *submit_list)
+ {
+     struct fd_submit_sp *fd_submit = to_fd_submit_sp(last_submit(submit_list));
+     struct fd_pipe *pipe = fd_submit->base.pipe;
+     struct kgsl_pipe *kgsl_pipe = to_kgsl_pipe(pipe);
++    struct kgsl_device *dev = to_kgsl_device(pipe->dev);
+     unsigned nr_cmds = 0;
+-
++    unsigned shared = dev->implicit_sync ?
++        import_dependencies(submit_list, &fd_submit->in_fence_fd) : 0;
+ 
+     MESA_TRACE_FUNC();
+ 
+@@ -55,13 +133,8 @@
+             };
+         }
+ 
+-        if (submit == last_submit(submit_list)) {
+-            DEBUG_MSG("merged %u submits", cmd_idx);
+-            break;
+-        }
+-
+-        list_del(&submit->node);
+-        fd_submit_del(submit);
++        /* Earlier submits are released only after the kernel submission and
++         * shared completion-fence publication below. */
+     }
+ 
+     struct kgsl_cmd_syncpoint_fence sync_fence = {
+@@ -90,25 +163,47 @@
+ 
+     if (ret) {
+         ERROR_MSG("submit failed %d (%s)", ret, strerror(errno));
++        if (dev->implicit_sync)
++            sync_fatal("submit");
+         goto fail;
+     }
+ 
+     fd_submit->out_fence->kfence = req.timestamp;
+ 
+-    if  (fd_submit->out_fence->use_fence_fd) {
++    if (fd_submit->out_fence->use_fence_fd || shared) {
+         int fd = timestamp_to_fd(pipe, req.timestamp);
+         if (fd < 0) {
++            if (dev->implicit_sync)
++                sync_fatal("timestamp");
+             ERROR_MSG("Failed to create sync file for timestamp (%s)", strerror(errno));
++            ret = -1;
+             goto fail;
+         }
+-
+-        fd_submit->out_fence->fence_fd = fd;
+-    }
+-
+-    if (fd_submit->in_fence_fd != -1)
++        if (shared) {
++            publish_completion(submit_list, fd);
++            if (dev->sync_logs < 8) {
++                dev->sync_logs++;
++                fprintf(stderr, "ANLAND_KGSL_SYNC pid=%d shared=%u completion=published\n",
++                        getpid(), shared);
++            }
++        }
++        if (fd_submit->out_fence->use_fence_fd)
++            fd_submit->out_fence->fence_fd = fd;
++        else
++            close(fd);
++    }
++
++fail:
++    if (fd_submit->in_fence_fd != -1) {
+         close(fd_submit->in_fence_fd);
+-
+-fail:
++        fd_submit->in_fence_fd = -1;
++    }
++    foreach_submit_safe (submit, submit_list) {
++        if (submit == last_submit(submit_list))
++            break;
++        list_del(&submit->node);
++        fd_submit_del(submit);
++    }
+     return ret;
+ }
+ 
