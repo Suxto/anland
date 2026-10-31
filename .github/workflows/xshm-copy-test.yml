@@ -2,7 +2,7 @@ name: XCB presentation probe tests
 on:
   push:
     branches: [ds3-xshm-copy-probe]
-    paths: [tools/xshm-copy/**, tools/present-copy/**, .github/workflows/xshm-copy-test.yml]
+    paths: [tools/xshm-copy/**, tools/present-copy/**, tools/sync-wait/**, .github/workflows/xshm-copy-test.yml]
   workflow_dispatch:
 permissions:
   contents: read
@@ -13,7 +13,12 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - run: sudo apt-get update && sudo apt-get install -y gcc libxcb1-dev libxcb-shm0-dev libxcb-present-dev xvfb xauth
+      - run: sudo apt-get update && sudo apt-get install -y gcc pkg-config libdrm-dev libxcb1-dev libxcb-shm0-dev libxcb-present-dev xvfb xauth
+      - name: Producer fence-wait ABI and sanitizer checks
+        run: |
+          bash tools/sync-wait/build-test.sh "$RUNNER_TEMP/sync-wait"
+          SANITIZE=address,undefined ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
+            bash tools/sync-wait/build-test.sh "$RUNNER_TEMP/sync-wait-asan"
       - name: Present COPY ABI and sanitizer checks
         run: |
           bash tools/present-copy/build-test.sh "$RUNNER_TEMP/present-copy"

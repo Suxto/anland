@@ -1,5 +1,9 @@
 # Present COPY isolation probe
 
+**Rejected in live DS3 testing:** Xwayland returned actual COPY completions, but
+severe visible twitching remained. The candidate was rolled back. Retained only
+as diagnostic evidence, not a recommended workaround; do not automatically retry.
+
 A private, per-application Linux preload diagnostic. It ORs the standard
 `XCB_PRESENT_OPTION_COPY` bit into Mesa's `xcb_present_pixmap` and (with Present
 1.4 headers) `xcb_present_pixmap_synced` requests. All other arguments, fences,

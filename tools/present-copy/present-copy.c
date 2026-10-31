@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // DS3-only diagnostic: preserve DMA-BUF rendering and all fence/timing fields,
 // but request the standard Present COPY path instead of a direct pixmap flip.
+// Rejected in live DS3 testing: real COPY completions still showed severe twitching.
 #define _GNU_SOURCE
 #include <xcb/present.h>
 #include <dlfcn.h>
